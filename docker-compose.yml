@@ -1,0 +1,268 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for storing supply chain data, predictions, and historical metrics
+  postgres:
+    image: postgres:15-alpine
+    container_name: supplychainoptix_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-supplychainoptix}
+      POSTGRES_USER: ${POSTGRES_USER:-scoptix_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scoptix_user} -d ${POSTGRES_DB:-supplychainoptix}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scoptix_network
+
+  # Redis for caching ML predictions and API responses
+  redis:
+    image: redis:7-alpine
+    container_name: supplychainoptix_cache
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_changeme}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - scoptix_network
+
+  # ML model training and prediction service
+  ml_service:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
+    container_name: supplychainoptix_ml
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-scoptix_user}:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/${POSTGRES_DB:-supplychainoptix}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/0
+      MODEL_REFRESH_INTERVAL: ${MODEL_REFRESH_INTERVAL:-3600}
+      ANOMALY_DETECTION_THRESHOLD: ${ANOMALY_DETECTION_THRESHOLD:-0.85}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data:ro
+      - ml_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - scoptix_network
+
+  # Data ingestion service for multi-source logistics data
+  data_ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingestion
+    container_name: supplychainoptix_ingestion
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-scoptix_user}:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/${POSTGRES_DB:-supplychainoptix}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/1
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-100}
+      GEOPOLITICAL_API_KEY: ${GEOPOLITICAL_API_KEY}
+      LOGISTICS_API_KEY: ${LOGISTICS_API_KEY}
+      WEATHER_API_KEY: ${WEATHER_API_KEY}
+      INGESTION_SCHEDULE: ${INGESTION_SCHEDULE:-*/15 * * * *}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./config:/app/config:ro
+      - ingestion_logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - scoptix_network
+
+  # Streamlit dashboard application
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
+    container_name: supplychainoptix_dashboard
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-scoptix_user}:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/${POSTGRES_DB:-supplychainoptix}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/2
+      ML_SERVICE_URL: http://ml_service:8000
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: none
+      CACHE_TTL: ${CACHE_TTL:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./app:/app
+      - ./config:/app/config:ro
+      - dashboard_logs:/app/logs
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ml_service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - scoptix_network
+
+  # Background worker for scheduled tasks (Prophet forecasting, anomaly detection)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: supplychainoptix_worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-scoptix_user}:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/${POSTGRES_DB:-supplychainoptix}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/3
+      ML_SERVICE_URL: http://ml_service:8000
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/4
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_changeme}@redis:6379/5
+      FORECAST_HORIZON_DAYS: ${FORECAST_HORIZON_DAYS:-14}
+      ISOLATION_FOREST_CONTAMINATION: ${ISOLATION_FOREST_CONTAMINATION:-0.1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./workers:/app/workers
+      - ./models:/app/models
+      - worker_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ml_service:
+        condition: service_healthy
+    networks:
+      - scoptix_network
+
+  # Nginx reverse proxy for production deployments
+  nginx:
+    image: nginx:alpine
+    container_name: supplychainoptix_proxy
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - dashboard
+    networks:
+      - scoptix_network
+    profiles:
+      - production
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: supplychainoptix_prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - scoptix_network
+    profiles:
+      - monitoring
+
+  # Grafana for visualization and alerting
+  grafana:
+    image: grafana/grafana:latest
+    container_name: supplychainoptix_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin_changeme}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - scoptix_network
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  ml_logs:
+    driver: local
+  ingestion_logs:
+    driver: local
+  dashboard_logs:
+    driver: local
+  worker_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  scoptix_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
